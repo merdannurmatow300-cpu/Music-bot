@@ -1,14 +1,19 @@
 """
 Trend Qo'shiqlar Telegram Bot
 =============================
-Admin qo'lda trend qo'shiqlar ro'yxatini boshqaradi.
-Foydalanuvchilar /trend buyrug'i orqali ro'yxatni ko'radi.
-Bot har kuni belgilangan vaqtda ro'yxatni kanalga avtomatik yuboradi.
+Admin botga to'g'ridan-to'g'ri mp3/audio fayl yuborib, trend qo'shiqlar
+ro'yxatiga qo'shadi. Foydalanuvchilar /trend buyrug'i orqali haqiqiy audio
+fayllarni (pleer ko'rinishida) oladi. Bot har kuni belgilangan vaqtda
+ro'yxatni kanalga avtomatik yuboradi.
 
 Ishga tushirish:
     pip install -r requirements.txt
     .env faylini to'ldiring (BOT_TOKEN, ADMIN_IDS, CHANNEL_ID, POST_HOUR, POST_MINUTE)
     python bot.py
+
+Qo'shiq qo'shish: admin botga mp3 (audio) faylni yuboradi — shu bo'ldi,
+alohida buyruq kerak emas. Xohlasa caption (izoh) sifatida nom yozib qo'ysa,
+o'sha nom saqlanadi.
 """
 
 import json
@@ -24,6 +29,8 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 # ---------------------------------------------------------------------------
@@ -50,25 +57,32 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Ma'lumotlarni saqlash / o'qish
 # ---------------------------------------------------------------------------
-def load_songs() -> list[str]:
+# Har bir qo'shiq lug'at (dict) sifatida saqlanadi:
+#   {"file_id": "...", "title": "...", "performer": "..."}
+def load_songs() -> list[dict]:
     if not DATA_FILE.exists():
         return []
     with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    # Eski formatdagi (faqat matn) ro'yxatlarga ham moslashuvchan bo'lish
+    migrated = []
+    for item in data:
+        if isinstance(item, str):
+            migrated.append({"file_id": None, "title": item, "performer": None})
+        else:
+            migrated.append(item)
+    return migrated
 
 
-def save_songs(songs: list[str]) -> None:
+def save_songs(songs: list[dict]) -> None:
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(songs, f, ensure_ascii=False, indent=2)
 
 
-def format_song_list(songs: list[str]) -> str:
-    if not songs:
-        return "Hozircha trend qo'shiqlar ro'yxati bo'sh. 🎵"
-    lines = ["🔥 <b>Hozirgi trend qo'shiqlar:</b>\n"]
-    for i, song in enumerate(songs, start=1):
-        lines.append(f"{i}. {song}")
-    return "\n".join(lines)
+def song_label(song: dict) -> str:
+    title = song.get("title") or "Nomsiz qo'shiq"
+    performer = song.get("performer")
+    return f"{performer} - {title}" if performer else title
 
 
 def is_admin(user_id: int) -> bool:
@@ -82,25 +96,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Salom! 👋\n\n"
         "Men trend qo'shiqlar botiman.\n"
-        "/trend — hozirgi trend qo'shiqlar ro'yxatini ko'rish\n"
+        "/trend — hozirgi trend qo'shiqlarni olish\n"
         "/help — barcha buyruqlar"
     )
 
 
 async def trend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     songs = load_songs()
-    await update.message.reply_text(format_song_list(songs), parse_mode=ParseMode.HTML)
+    if not songs:
+        await update.message.reply_text("Hozircha trend qo'shiqlar ro'yxati bo'sh. 🎵")
+        return
+
+    await update.message.reply_text(f"🔥 Hozirgi trend qo'shiqlar ({len(songs)} ta):")
+    for song in songs:
+        if song.get("file_id"):
+            await update.message.reply_audio(
+                audio=song["file_id"],
+                title=song.get("title"),
+                performer=song.get("performer"),
+            )
+        else:
+            await update.message.reply_text(f"🎵 {song_label(song)}")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "<b>Foydalanuvchi buyruqlari:</b>\n"
-        "/trend — trend qo'shiqlar ro'yxatini ko'rish\n\n"
+        "/trend — trend qo'shiqlarni olish\n\n"
     )
     if is_admin(update.effective_user.id):
         text += (
             "<b>Admin buyruqlari:</b>\n"
-            "/add Qo'shiq nomi - Ijrochi — ro'yxatga qo'shish\n"
+            "Qo'shiq qo'shish uchun botga to'g'ridan-to'g'ri mp3 (audio) fayl yuboring.\n"
+            "Caption (izoh) yozsangiz, u nom sifatida saqlanadi.\n\n"
+            "/list — ro'yxatni raqamlar bilan ko'rish (matn holida)\n"
             "/remove 2 — ro'yxatdan raqami bo'yicha o'chirish\n"
             "/clear — ro'yxatni tozalash\n"
             "/post — ro'yxatni hoziroq kanalga yuborish\n"
@@ -109,24 +138,46 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Buyruqlar (faqat admin uchun)
+# Admin: mp3 fayl yuborib qo'shiq qo'shish
 # ---------------------------------------------------------------------------
-async def add_song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Bu buyruq faqat adminlar uchun.")
-        return
+        return  # oddiy foydalanuvchi audio yuborsa, e'tiborsiz qoldiramiz
 
-    song_name = " ".join(context.args).strip()
-    if not song_name:
-        await update.message.reply_text(
-            "To'g'ri format: /add Qo'shiq nomi - Ijrochi"
-        )
+    audio = update.message.audio
+    voice = update.message.voice
+
+    if audio:
+        file_id = audio.file_id
+        title = audio.title or update.message.caption or "Nomsiz qo'shiq"
+        performer = audio.performer
+    elif voice:
+        file_id = voice.file_id
+        title = update.message.caption or "Nomsiz qo'shiq"
+        performer = None
+    else:
         return
 
     songs = load_songs()
-    songs.append(song_name)
+    songs.append({"file_id": file_id, "title": title, "performer": performer})
     save_songs(songs)
-    await update.message.reply_text(f"Qo'shildi ✅\n{song_name}")
+
+    label = f"{performer} - {title}" if performer else title
+    await update.message.reply_text(f"Qo'shildi ✅\n🎵 {label}")
+
+
+# ---------------------------------------------------------------------------
+# Buyruqlar (faqat admin uchun)
+# ---------------------------------------------------------------------------
+async def list_songs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    songs = load_songs()
+    if not songs:
+        await update.message.reply_text("Ro'yxat bo'sh.")
+        return
+    lines = ["📋 Ro'yxat:\n"]
+    for i, song in enumerate(songs, start=1):
+        lines.append(f"{i}. {song_label(song)}")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def remove_song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -135,7 +186,7 @@ async def remove_song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("To'g'ri format: /remove 2  (raqam /trend ro'yxatidagi tartib raqami)")
+        await update.message.reply_text("To'g'ri format: /remove 2  (raqam /list ro'yxatidagi tartib raqami)")
         return
 
     idx = int(context.args[0]) - 1
@@ -143,7 +194,7 @@ async def remove_song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if 0 <= idx < len(songs):
         removed = songs.pop(idx)
         save_songs(songs)
-        await update.message.reply_text(f"O'chirildi ❌\n{removed}")
+        await update.message.reply_text(f"O'chirildi ❌\n{song_label(removed)}")
     else:
         await update.message.reply_text("Bunday raqamli qo'shiq topilmadi.")
 
@@ -175,11 +226,21 @@ async def send_daily_list(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not songs:
         logger.info("Ro'yxat bo'sh, kanalga hech narsa yuborilmadi.")
         return
+
     await context.bot.send_message(
         chat_id=CHANNEL_ID,
-        text=format_song_list(songs),
-        parse_mode=ParseMode.HTML,
+        text=f"🔥 Bugungi trend qo'shiqlar ({len(songs)} ta):",
     )
+    for song in songs:
+        if song.get("file_id"):
+            await context.bot.send_audio(
+                chat_id=CHANNEL_ID,
+                audio=song["file_id"],
+                title=song.get("title"),
+                performer=song.get("performer"),
+            )
+        else:
+            await context.bot.send_message(chat_id=CHANNEL_ID, text=f"🎵 {song_label(song)}")
 
 
 # ---------------------------------------------------------------------------
@@ -193,12 +254,14 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("trend", trend))
-    app.add_handler(CommandHandler("list", trend))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("add", add_song))
+    app.add_handler(CommandHandler("list", list_songs))
     app.add_handler(CommandHandler("remove", remove_song))
     app.add_handler(CommandHandler("clear", clear_songs))
     app.add_handler(CommandHandler("post", post_now))
+
+    # Admin mp3/audio yoki ovozli xabar yuborganda avtomatik qo'shiladi
+    app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, receive_audio))
 
     # Har kuni belgilangan vaqtda (mahalliy vaqt, TIMEZONE_OFFSET hisobga olinadi)
     post_time_utc_hour = (POST_HOUR - TIMEZONE_OFFSET) % 24
@@ -213,3 +276,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
