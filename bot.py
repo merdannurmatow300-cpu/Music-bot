@@ -1,3 +1,4 @@
+
 """
 Trend Qo'shiqlar Telegram Bot
 =============================
@@ -276,4 +277,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
